@@ -70,8 +70,11 @@ async function getTokensForRole({ clientId, orgId, customerId, agentId, role }) 
 /**
  * Log the notification to backend audit log.
  * Backend writes to delivery_notifications_log (PostgreSQL).
+ *
+ * @param {{ orderId, clientId, orgId, role, event, channel, title, body, success, errorMessage }} params
+ * orgId is required since V8 migration — filters logs per branch in admin panel.
  */
-async function logNotification({ orderId, clientId, role, event, channel = 'PUSH', title, body, success = true, errorMessage }) {
+async function logNotification({ orderId, clientId, orgId, role, event, channel = 'PUSH', title, body, success = true, errorMessage }) {
   try {
     await fetch(`${INTERNAL_API}/delivery/notifications-log`, {
       method: 'POST',
@@ -79,7 +82,18 @@ async function logNotification({ orderId, clientId, role, event, channel = 'PUSH
         'Authorization': `Bearer ${INTERNAL_TOKEN}`,
         'Content-Type':  'application/json',
       },
-      body: JSON.stringify({ orderId, clientId, targetRole: role, eventType: event, channel, title, body, success, errorMessage }),
+      body: JSON.stringify({
+        orderId,
+        clientId,
+        orgId,          // branch-level — added in V8 migration
+        targetRole:   role,
+        eventType:    event,
+        channel,
+        title,
+        body,
+        success,
+        errorMessage,
+      }),
     });
   } catch (err) {
     // Non-fatal — logging failure shouldn't break the order flow
@@ -100,12 +114,12 @@ export async function notifyNewOrder({ order }) {
   try {
     // Topic-based push: all restaurant devices subscribed to this topic get it
     await sendPushToTopic(`restaurant_${client_id}_${org_id}`, { title, body, data });
-    await logNotification({ orderId, clientId: client_id, role: 'restaurant', event: 'NEW_ORDER', title, body });
+    await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'restaurant', event: 'NEW_ORDER', title, body });
   } catch (topicErr) {
     // Fallback: individual token push if topic fails
     const tokens = await getTokensForRole({ clientId: client_id, orgId: org_id, role: 'restaurant' });
     await sendPushToTokens(tokens, { title, body, data });
-    await logNotification({ orderId, clientId: client_id, role: 'restaurant', event: 'NEW_ORDER', title, body });
+    await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'restaurant', event: 'NEW_ORDER', title, body });
   }
 }
 
@@ -114,7 +128,7 @@ export async function notifyNewOrder({ order }) {
 // 2. ORDER CONFIRMED → Customer (push + email)
 // ----------------------------------------------------------------
 export async function notifyOrderConfirmed({ order }) {
-  const { id: orderId, client_id, order_no, customer_id, customer_email,
+  const { id: orderId, client_id, org_id, order_no, customer_id, customer_email,
           customer_name, estimated_time_minutes, order_lines_snapshot, grand_total } = order;
 
   const title = `\u2705 Order #${order_no} Confirmed!`;
@@ -122,9 +136,9 @@ export async function notifyOrderConfirmed({ order }) {
   const data  = { orderId, event: 'ORDER_CONFIRMED', screen: 'OrderTracking' };
 
   // Push
-  const tokens = await getTokensForRole({ clientId: client_id, customerId: customer_id, role: 'customer' });
+  const tokens = await getTokensForRole({ clientId: client_id, orgId: org_id, customerId: customer_id, role: 'customer' });
   await sendPushToTokens(tokens, { title, body, data });
-  await logNotification({ orderId, clientId: client_id, role: 'customer', event: 'ORDER_CONFIRMED', channel: 'PUSH', title, body });
+  await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'customer', event: 'ORDER_CONFIRMED', channel: 'PUSH', title, body });
 
   // Email via Gmail API
   if (customer_email) {
@@ -137,10 +151,10 @@ export async function notifyOrderConfirmed({ order }) {
         grandTotal:    grand_total,
         estimatedTime: estimated_time_minutes,
       });
-      await logNotification({ orderId, clientId: client_id, role: 'customer', event: 'ORDER_CONFIRMED', channel: 'EMAIL', title, body });
+      await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'customer', event: 'ORDER_CONFIRMED', channel: 'EMAIL', title, body });
     } catch (emailErr) {
       console.error('[notifyOrderConfirmed] Email failed:', emailErr.message);
-      await logNotification({ orderId, clientId: client_id, role: 'customer', event: 'ORDER_CONFIRMED', channel: 'EMAIL', title, body, success: false, errorMessage: emailErr.message });
+      await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'customer', event: 'ORDER_CONFIRMED', channel: 'EMAIL', title, body, success: false, errorMessage: emailErr.message });
     }
   }
 }
@@ -150,16 +164,16 @@ export async function notifyOrderConfirmed({ order }) {
 // 3. AGENT ASSIGNED → Delivery agent
 // ----------------------------------------------------------------
 export async function notifyAgentAssigned({ order, agent }) {
-  const { id: orderId, client_id, order_no, delivery_address } = order;
+  const { id: orderId, client_id, org_id, order_no, delivery_address } = order;
   const { id: agentId } = agent;
 
   const title = `\uD83D\uDEB4 New Delivery Assigned`;
   const body  = `Order #${order_no}. Deliver to: ${delivery_address?.area || 'see app'}.`;
   const data  = { orderId, event: 'AGENT_ASSIGNED', screen: 'AgentDelivery' };
 
-  const tokens = await getTokensForRole({ clientId: client_id, agentId, role: 'agent' });
+  const tokens = await getTokensForRole({ clientId: client_id, orgId: org_id, agentId, role: 'agent' });
   await sendPushToTokens(tokens, { title, body, data });
-  await logNotification({ orderId, clientId: client_id, role: 'agent', event: 'AGENT_ASSIGNED', title, body });
+  await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'agent', event: 'AGENT_ASSIGNED', title, body });
 }
 
 
@@ -167,15 +181,15 @@ export async function notifyAgentAssigned({ order, agent }) {
 // 4. ORDER PICKED UP → Customer
 // ----------------------------------------------------------------
 export async function notifyOrderPickedUp({ order }) {
-  const { id: orderId, client_id, order_no, customer_id } = order;
+  const { id: orderId, client_id, org_id, order_no, customer_id } = order;
 
   const title = `\uD83D\uDCE6 Order #${order_no} Picked Up`;
   const body  = `Your order is on the way! You can track it live.`;
   const data  = { orderId, event: 'ORDER_PICKED_UP', screen: 'OrderTracking' };
 
-  const tokens = await getTokensForRole({ clientId: client_id, customerId: customer_id, role: 'customer' });
+  const tokens = await getTokensForRole({ clientId: client_id, orgId: org_id, customerId: customer_id, role: 'customer' });
   await sendPushToTokens(tokens, { title, body, data });
-  await logNotification({ orderId, clientId: client_id, role: 'customer', event: 'ORDER_PICKED_UP', title, body });
+  await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'customer', event: 'ORDER_PICKED_UP', title, body });
 }
 
 
@@ -190,17 +204,18 @@ export async function notifyOrderDelivered({ order }) {
   const custTitle = `\uD83C\uDF89 Order #${order_no} Delivered!`;
   const custBody  = `Enjoy your meal! \u20B9${grand_total} paid. Please rate your experience.`;
   const custData  = { orderId, event: 'ORDER_DELIVERED', screen: 'OrderReview' };
-  const custTokens = await getTokensForRole({ clientId: client_id, customerId: customer_id, role: 'customer' });
+  const custTokens = await getTokensForRole({ clientId: client_id, orgId: org_id, customerId: customer_id, role: 'customer' });
   await sendPushToTokens(custTokens, { title: custTitle, body: custBody, data: custData });
-  await logNotification({ orderId, clientId: client_id, role: 'customer', event: 'ORDER_DELIVERED', channel: 'PUSH', title: custTitle, body: custBody });
+  await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'customer', event: 'ORDER_DELIVERED', channel: 'PUSH', title: custTitle, body: custBody });
 
   // Customer email via Gmail API
   if (customer_email) {
     try {
       await sendOrderDeliveredEmail({ to: customer_email, customerName: customer_name, orderNo: order_no, grandTotal: grand_total });
-      await logNotification({ orderId, clientId: client_id, role: 'customer', event: 'ORDER_DELIVERED', channel: 'EMAIL', title: custTitle, body: custBody });
+      await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'customer', event: 'ORDER_DELIVERED', channel: 'EMAIL', title: custTitle, body: custBody });
     } catch (emailErr) {
       console.error('[notifyOrderDelivered] Email failed:', emailErr.message);
+      await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'customer', event: 'ORDER_DELIVERED', channel: 'EMAIL', title: custTitle, body: custBody, success: false, errorMessage: emailErr.message });
     }
   }
 
@@ -213,7 +228,7 @@ export async function notifyOrderDelivered({ order }) {
     const restTokens = await getTokensForRole({ clientId: client_id, orgId: org_id, role: 'restaurant' });
     await sendPushToTokens(restTokens, { title: restTitle, body: restBody, data: { orderId, event: 'ORDER_DELIVERED' } });
   }
-  await logNotification({ orderId, clientId: client_id, role: 'restaurant', event: 'ORDER_DELIVERED', title: restTitle, body: restBody });
+  await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'restaurant', event: 'ORDER_DELIVERED', title: restTitle, body: restBody });
 }
 
 
@@ -227,17 +242,18 @@ export async function notifyOrderCancelled({ order, cancelledBy = 'system', reas
   // Customer push
   const custTitle = `\u274C Order #${order_no} Cancelled`;
   const custBody  = reason ? `Cancelled: ${reason}` : `Your order has been cancelled.`;
-  const custTokens = await getTokensForRole({ clientId: client_id, customerId: customer_id, role: 'customer' });
+  const custTokens = await getTokensForRole({ clientId: client_id, orgId: org_id, customerId: customer_id, role: 'customer' });
   await sendPushToTokens(custTokens, { title: custTitle, body: custBody, data: { orderId, event: 'ORDER_CANCELLED' } });
-  await logNotification({ orderId, clientId: client_id, role: 'customer', event: 'ORDER_CANCELLED', channel: 'PUSH', title: custTitle, body: custBody });
+  await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'customer', event: 'ORDER_CANCELLED', channel: 'PUSH', title: custTitle, body: custBody });
 
   // Customer email via Gmail API
   if (customer_email) {
     try {
       await sendOrderCancelledEmail({ to: customer_email, customerName: customer_name, orderNo: order_no, reason });
-      await logNotification({ orderId, clientId: client_id, role: 'customer', event: 'ORDER_CANCELLED', channel: 'EMAIL', title: custTitle, body: custBody });
+      await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'customer', event: 'ORDER_CANCELLED', channel: 'EMAIL', title: custTitle, body: custBody });
     } catch (emailErr) {
       console.error('[notifyOrderCancelled] Email failed:', emailErr.message);
+      await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'customer', event: 'ORDER_CANCELLED', channel: 'EMAIL', title: custTitle, body: custBody, success: false, errorMessage: emailErr.message });
     }
   }
 
@@ -250,5 +266,5 @@ export async function notifyOrderCancelled({ order, cancelledBy = 'system', reas
     const restTokens = await getTokensForRole({ clientId: client_id, orgId: org_id, role: 'restaurant' });
     await sendPushToTokens(restTokens, { title: restTitle, body: restBody, data: { orderId, event: 'ORDER_CANCELLED' } });
   }
-  await logNotification({ orderId, clientId: client_id, role: 'restaurant', event: 'ORDER_CANCELLED', title: restTitle, body: restBody });
+  await logNotification({ orderId, clientId: client_id, orgId: org_id, role: 'restaurant', event: 'ORDER_CANCELLED', title: restTitle, body: restBody });
 }
