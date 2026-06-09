@@ -47,6 +47,9 @@ COMMENT ON VIEW v_active_delivery_orders IS 'All non-terminal delivery orders wi
 
 
 -- Order history per customer phone (for order history page)
+-- Used by: GET /delivery/orders?phone=&orgId=
+-- orgId = organizations.id (branch UUID) — NOT the top-level clientId.
+-- Backend derives clientId from orgId internally via organizations.clientid.
 CREATE OR REPLACE VIEW v_customer_order_history AS
 SELECT
     d.id,
@@ -59,10 +62,13 @@ SELECT
     d.order_date,
     d.customer_phone,
     d.client_id,
-    c.name AS restaurant_name
+    d.org_id,
+    c.name AS restaurant_name,
+    o.name AS branch_name
 FROM  delivery_orders d
 JOIN  clients c ON c.id = d.client_id
+LEFT JOIN organizations o ON o.id = d.org_id
 WHERE d.isactive = 'Y'
 ORDER BY d.order_date DESC;
 
-COMMENT ON VIEW v_customer_order_history IS 'Order history per customer, used by GET /delivery/orders?phone=&clientId=';
+COMMENT ON VIEW v_customer_order_history IS 'Order history per customer, used by GET /delivery/orders?phone=&orgId= (branch-level)';
