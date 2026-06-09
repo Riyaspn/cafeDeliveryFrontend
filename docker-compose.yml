@@ -1,0 +1,92 @@
+# ================================================================
+# CafeQR Delivery — Docker Compose
+# Services: PostgreSQL, Redis, RabbitMQ
+# Next.js frontend is deployed separately (Vercel / PM2 on VPS)
+#
+# Usage:
+#   docker compose up -d          # start all services
+#   docker compose down           # stop all services
+#   docker compose logs -f        # tail all logs
+# ================================================================
+
+version: '3.9'
+
+services:
+
+  # ----------------------------------------------------------
+  # PostgreSQL — primary database
+  # ----------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: cafeqr_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-cafeqr_delivery}
+      POSTGRES_USER:     ${POSTGRES_USER:-cafeqr_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+        # ^ SQL files in db/migrations/ are run automatically
+        #   on first container start (alphabetical order)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cafeqr_user} -d ${POSTGRES_DB:-cafeqr_delivery}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cafeqr_net
+
+  # ----------------------------------------------------------
+  # Redis — OTP cache, rate limiting, session tokens
+  # ----------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: cafeqr_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - cafeqr_net
+
+  # ----------------------------------------------------------
+  # RabbitMQ — async order events + notification queues
+  # ----------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: cafeqr_rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${POSTGRES_USER:-cafeqr_user}
+      RABBITMQ_DEFAULT_PASS: ${POSTGRES_PASSWORD:-changeme}
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI (http://localhost:15672)
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cafeqr_net
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+
+networks:
+  cafeqr_net:
+    driver: bridge

@@ -1,172 +1,157 @@
 /**
- * notificationTriggers.js
- * All 6 push notification flows for CafeQR Delivery.
- * Import in API routes (server-side only).
+ * utils/notificationTriggers.js
+ * Push notification flows — server-side only.
+ * Reads FCM tokens from PostgreSQL (Docker), NOT Supabase.
  *
- * Flow map:
- *   1. NEW_ORDER         → Restaurant staff + kitchen
- *   2. ORDER_CONFIRMED   → Customer
- *   3. ORDER_ASSIGNED    → Delivery agent
- *   4. ORDER_PICKED_UP   → Customer
- *   5. ORDER_DELIVERED   → Customer + Restaurant
- *   6. ORDER_CANCELLED   → Customer + Restaurant
+ * Data flow:
+ *   API route → publishNotification() → RabbitMQ queue
+ *     → workers/notificationWorker.js → these trigger functions
+ *
+ * All 6 flows:
+ *   1. NEW_ORDER       → Restaurant staff
+ *   2. ORDER_CONFIRMED → Customer
+ *   3. AGENT_ASSIGNED  → Delivery agent
+ *   4. ORDER_PICKED_UP → Customer
+ *   5. ORDER_DELIVERED → Customer + Restaurant
+ *   6. ORDER_CANCELLED → Customer + Restaurant
  */
-
 import { sendPushToTokens, sendPushToTopic } from '@/lib/fcmAdmin';
-import { createAdminClient } from '@/lib/supabaseClient';
+import { query }                             from '@/lib/db';
 
-/**
- * Fetch FCM tokens from the delivery_fcm_tokens table.
- * role: 'customer' | 'restaurant' | 'agent'
- */
-async function getTokensForRole(supabase, { clientId, orgId, customerId, agentId, role }) {
-  let query = supabase
-    .from('delivery_fcm_tokens')
-    .select('token')
-    .eq('is_active', true)
-    .eq('role', role);
+// ----------------------------------------------------------------
+// Token fetcher from PostgreSQL
+// ----------------------------------------------------------------
 
-  if (role === 'restaurant') query = query.eq('client_id', clientId).eq('org_id', orgId);
-  if (role === 'customer' && customerId) query = query.eq('entity_id', customerId);
-  if (role === 'agent' && agentId) query = query.eq('entity_id', agentId);
+async function getTokensForRole({
+  clientId, orgId, customerId, agentId, role,
+}) {
+  let sql    = `SELECT token FROM delivery_fcm_tokens WHERE is_active = true AND role = $1`;
+  const params = [role];
 
-  const { data, error } = await query;
-  if (error) { console.error('[FCM] getTokens error:', error); return []; }
-  return (data || []).map((r) => r.token).filter(Boolean);
+  if (role === 'restaurant') {
+    sql += ` AND client_id = $${params.push(clientId)} AND org_id = $${params.push(orgId)}`;
+  } else if (role === 'customer' && customerId) {
+    sql += ` AND entity_id = $${params.push(customerId)}`;
+  } else if (role === 'agent' && agentId) {
+    sql += ` AND entity_id = $${params.push(agentId)}`;
+  }
+
+  const { rows } = await query(sql, params);
+  return rows.map((r) => r.token).filter(Boolean);
 }
 
-/** Log notification to delivery_notifications_log for audit trail */
-async function logNotification(supabase, { orderId, clientId, role, event, title, body }) {
-  await supabase.from('delivery_notifications_log').insert({
-    order_id: orderId, client_id: clientId,
-    target_role: role, event_type: event,
-    title, body, sent_at: new Date().toISOString(),
-  });
+async function logNotification({ orderId, clientId, role, event, title, body }) {
+  await query(
+    `INSERT INTO delivery_notifications_log
+       (order_id, client_id, target_role, event_type, title, body, sent_at)
+     VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+    [orderId, clientId, role, event, title, body],
+  );
 }
 
 // ----------------------------------------------------------------
 // 1. NEW ORDER → Restaurant
 // ----------------------------------------------------------------
 export async function notifyNewOrder({ order }) {
-  const supabase = createAdminClient();
-  const { id: orderId, client_id, org_id, order_no, customer_name } = order;
-
+  const { id, client_id, org_id, order_no, customer_name } = order;
   const title = `🛒 New Order #${order_no}`;
-  const body  = `${customer_name} placed a delivery order. Tap to view.`;
-  const data  = { orderId, event: 'NEW_ORDER', screen: 'OrderDetails' };
+  const body  = `${customer_name} placed a delivery order.`;
+  const data  = { orderId: id, event: 'NEW_ORDER' };
 
-  // Try topic first (restaurant devices subscribed to topic)
   try {
     await sendPushToTopic(`restaurant_${client_id}_${org_id}`, { title, body, data });
   } catch {
-    // Fallback to individual tokens
-    const tokens = await getTokensForRole(supabase, { clientId: client_id, orgId: org_id, role: 'restaurant' });
+    const tokens = await getTokensForRole({ clientId: client_id, orgId: org_id, role: 'restaurant' });
     await sendPushToTokens(tokens, { title, body, data });
   }
-  await logNotification(supabase, { orderId, clientId: client_id, role: 'restaurant', event: 'NEW_ORDER', title, body });
+  await logNotification({ orderId: id, clientId: client_id, role: 'restaurant', event: 'NEW_ORDER', title, body });
 }
 
 // ----------------------------------------------------------------
 // 2. ORDER CONFIRMED → Customer
 // ----------------------------------------------------------------
 export async function notifyOrderConfirmed({ order }) {
-  const supabase = createAdminClient();
-  const { id: orderId, client_id, order_no, customer_id, estimated_time_minutes } = order;
-
+  const { id, client_id, order_no, customer_id, estimated_time_minutes } = order;
   const title = `✅ Order #${order_no} Confirmed!`;
-  const body  = `Your order is confirmed. Estimated time: ${estimated_time_minutes || '20-30'} mins.`;
-  const data  = { orderId, event: 'ORDER_CONFIRMED', screen: 'OrderTracking' };
+  const body  = `Estimated delivery: ${estimated_time_minutes || 30} mins.`;
+  const data  = { orderId: id, event: 'ORDER_CONFIRMED' };
 
-  const tokens = await getTokensForRole(supabase, { clientId: client_id, customerId: customer_id, role: 'customer' });
+  const tokens = await getTokensForRole({ clientId: client_id, customerId: customer_id, role: 'customer' });
   await sendPushToTokens(tokens, { title, body, data });
-  await logNotification(supabase, { orderId, clientId: client_id, role: 'customer', event: 'ORDER_CONFIRMED', title, body });
+  await logNotification({ orderId: id, clientId: client_id, role: 'customer', event: 'ORDER_CONFIRMED', title, body });
 }
 
 // ----------------------------------------------------------------
 // 3. AGENT ASSIGNED → Delivery Agent
 // ----------------------------------------------------------------
 export async function notifyAgentAssigned({ order, agent }) {
-  const supabase = createAdminClient();
-  const { id: orderId, client_id, order_no, delivery_address } = order;
-  const { id: agentId, name: agentName } = agent;
-
+  const { id, client_id, order_no, delivery_address } = order;
+  const { id: agentId } = agent;
   const title = `🚴 New Delivery Assigned`;
-  const body  = `Order #${order_no} is ready for pickup. Deliver to: ${delivery_address?.area || 'see app'}.`;
-  const data  = { orderId, event: 'AGENT_ASSIGNED', screen: 'AgentDelivery' };
+  const body  = `Order #${order_no} → ${delivery_address?.area || 'see app'}`;
+  const data  = { orderId: id, event: 'AGENT_ASSIGNED' };
 
-  const tokens = await getTokensForRole(supabase, { clientId: client_id, agentId, role: 'agent' });
+  const tokens = await getTokensForRole({ clientId: client_id, agentId, role: 'agent' });
   await sendPushToTokens(tokens, { title, body, data });
-  await logNotification(supabase, { orderId, clientId: client_id, role: 'agent', event: 'AGENT_ASSIGNED', title, body });
+  await logNotification({ orderId: id, clientId: client_id, role: 'agent', event: 'AGENT_ASSIGNED', title, body });
 }
 
 // ----------------------------------------------------------------
 // 4. ORDER PICKED UP → Customer
 // ----------------------------------------------------------------
 export async function notifyOrderPickedUp({ order }) {
-  const supabase = createAdminClient();
-  const { id: orderId, client_id, order_no, customer_id } = order;
-
+  const { id, client_id, order_no, customer_id } = order;
   const title = `📦 Order #${order_no} Picked Up`;
-  const body  = `Your order is on the way! Track it live.`;
-  const data  = { orderId, event: 'ORDER_PICKED_UP', screen: 'OrderTracking' };
+  const body  = `Your order is on the way!`;
+  const data  = { orderId: id, event: 'ORDER_PICKED_UP' };
 
-  const tokens = await getTokensForRole(supabase, { clientId: client_id, customerId: customer_id, role: 'customer' });
+  const tokens = await getTokensForRole({ clientId: client_id, customerId: customer_id, role: 'customer' });
   await sendPushToTokens(tokens, { title, body, data });
-  await logNotification(supabase, { orderId, clientId: client_id, role: 'customer', event: 'ORDER_PICKED_UP', title, body });
+  await logNotification({ orderId: id, clientId: client_id, role: 'customer', event: 'ORDER_PICKED_UP', title, body });
 }
 
 // ----------------------------------------------------------------
 // 5. ORDER DELIVERED → Customer + Restaurant
 // ----------------------------------------------------------------
 export async function notifyOrderDelivered({ order }) {
-  const supabase = createAdminClient();
-  const { id: orderId, client_id, org_id, order_no, customer_id, grand_total } = order;
+  const { id, client_id, org_id, order_no, customer_id, grand_total } = order;
 
-  // Customer notification
   const custTitle = `🎉 Order #${order_no} Delivered!`;
-  const custBody  = `Enjoy your meal! Total: ₹${grand_total}. Rate your experience.`;
-  const custData  = { orderId, event: 'ORDER_DELIVERED', screen: 'OrderReview' };
-  const custTokens = await getTokensForRole(supabase, { clientId: client_id, customerId: customer_id, role: 'customer' });
-  await sendPushToTokens(custTokens, { title: custTitle, body: custBody, data: custData });
-  await logNotification(supabase, { orderId, clientId: client_id, role: 'customer', event: 'ORDER_DELIVERED', title: custTitle, body: custBody });
+  const custBody  = `Enjoy your meal! Total: ₹${grand_total}.`;
+  const custTokens = await getTokensForRole({ clientId: client_id, customerId: customer_id, role: 'customer' });
+  await sendPushToTokens(custTokens, { title: custTitle, body: custBody, data: { orderId: id, event: 'ORDER_DELIVERED' } });
+  await logNotification({ orderId: id, clientId: client_id, role: 'customer', event: 'ORDER_DELIVERED', title: custTitle, body: custBody });
 
-  // Restaurant notification
   const restTitle = `✅ Order #${order_no} Delivered`;
-  const restBody  = `Order successfully delivered. Amount: ₹${grand_total}.`;
-  const restData  = { orderId, event: 'ORDER_DELIVERED', screen: 'OrderDetails' };
+  const restBody  = `Amount: ₹${grand_total}.`;
   try {
-    await sendPushToTopic(`restaurant_${client_id}_${org_id}`, { title: restTitle, body: restBody, data: restData });
+    await sendPushToTopic(`restaurant_${client_id}_${org_id}`, { title: restTitle, body: restBody, data: { orderId: id, event: 'ORDER_DELIVERED' } });
   } catch {
-    const restTokens = await getTokensForRole(supabase, { clientId: client_id, orgId: org_id, role: 'restaurant' });
-    await sendPushToTokens(restTokens, { title: restTitle, body: restBody, data: restData });
+    const restTokens = await getTokensForRole({ clientId: client_id, orgId: org_id, role: 'restaurant' });
+    await sendPushToTokens(restTokens, { title: restTitle, body: restBody, data: { orderId: id, event: 'ORDER_DELIVERED' } });
   }
-  await logNotification(supabase, { orderId, clientId: client_id, role: 'restaurant', event: 'ORDER_DELIVERED', title: restTitle, body: restBody });
+  await logNotification({ orderId: id, clientId: client_id, role: 'restaurant', event: 'ORDER_DELIVERED', title: restTitle, body: restBody });
 }
 
 // ----------------------------------------------------------------
 // 6. ORDER CANCELLED → Customer + Restaurant
 // ----------------------------------------------------------------
 export async function notifyOrderCancelled({ order, cancelledBy = 'system', reason = '' }) {
-  const supabase = createAdminClient();
-  const { id: orderId, client_id, org_id, order_no, customer_id } = order;
+  const { id, client_id, org_id, order_no, customer_id } = order;
 
-  // Customer notification
   const custTitle = `❌ Order #${order_no} Cancelled`;
-  const custBody  = reason ? `Your order was cancelled. Reason: ${reason}.` : `Your order has been cancelled.`;
-  const custData  = { orderId, event: 'ORDER_CANCELLED', screen: 'OrderStatus' };
-  const custTokens = await getTokensForRole(supabase, { clientId: client_id, customerId: customer_id, role: 'customer' });
-  await sendPushToTokens(custTokens, { title: custTitle, body: custBody, data: custData });
-  await logNotification(supabase, { orderId, clientId: client_id, role: 'customer', event: 'ORDER_CANCELLED', title: custTitle, body: custBody });
+  const custBody  = reason ? `Reason: ${reason}` : `Your order has been cancelled.`;
+  const custTokens = await getTokensForRole({ clientId: client_id, customerId: customer_id, role: 'customer' });
+  await sendPushToTokens(custTokens, { title: custTitle, body: custBody, data: { orderId: id, event: 'ORDER_CANCELLED' } });
+  await logNotification({ orderId: id, clientId: client_id, role: 'customer', event: 'ORDER_CANCELLED', title: custTitle, body: custBody });
 
-  // Restaurant notification
   const restTitle = `❌ Order #${order_no} Cancelled`;
-  const restBody  = `Order cancelled by ${cancelledBy}${reason ? ': ' + reason : ''}.`;
-  const restData  = { orderId, event: 'ORDER_CANCELLED', screen: 'OrderDetails' };
+  const restBody  = `Cancelled by ${cancelledBy}${reason ? ': ' + reason : ''}.`;
   try {
-    await sendPushToTopic(`restaurant_${client_id}_${org_id}`, { title: restTitle, body: restBody, data: restData });
+    await sendPushToTopic(`restaurant_${client_id}_${org_id}`, { title: restTitle, body: restBody, data: { orderId: id, event: 'ORDER_CANCELLED' } });
   } catch {
-    const restTokens = await getTokensForRole(supabase, { clientId: client_id, orgId: org_id, role: 'restaurant' });
-    await sendPushToTokens(restTokens, { title: restTitle, body: restBody, data: restData });
+    const restTokens = await getTokensForRole({ clientId: client_id, orgId: org_id, role: 'restaurant' });
+    await sendPushToTokens(restTokens, { title: restTitle, body: restBody, data: { orderId: id, event: 'ORDER_CANCELLED' } });
   }
-  await logNotification(supabase, { orderId, clientId: client_id, role: 'restaurant', event: 'ORDER_CANCELLED', title: restTitle, body: restBody });
+  await logNotification({ orderId: id, clientId: client_id, role: 'restaurant', event: 'ORDER_CANCELLED', title: restTitle, body: restBody });
 }
